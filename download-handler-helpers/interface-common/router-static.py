@@ -1,0 +1,3 @@
+// Auto-generated file: /Users/kevinguoquan/Desktop/zama备用文件/测试/Zama项目/alumninet_fhe/download-handler-helpers/interface-common/router-static.py
+// Generated at: 2025-12-03T23:45:44.247Z
+
