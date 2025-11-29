@@ -1,18 +1,19 @@
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import '@rainbow-me/rainbowkit/styles.css';
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { getContractReadOnly, getContractWithSigner } from "./components/useContract";
 import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
+import { ethers } from 'ethers';
 
-interface AlumniData {
+interface AlumniRequest {
   id: string;
   name: string;
-  graduationYear: string;
-  encryptedDonation: string;
+  encryptedValue: string;
   publicValue1: number;
   publicValue2: number;
+  description: string;
   timestamp: number;
   creator: string;
   isVerified?: boolean;
@@ -22,22 +23,24 @@ interface AlumniData {
 const App: React.FC = () => {
   const { address, isConnected } = useAccount();
   const [loading, setLoading] = useState(true);
-  const [alumniList, setAlumniList] = useState<AlumniData[]>([]);
+  const [requests, setRequests] = useState<AlumniRequest[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
-  const [creatingAlumni, setCreatingAlumni] = useState(false);
+  const [creatingRequest, setCreatingRequest] = useState(false);
   const [transactionStatus, setTransactionStatus] = useState<{ visible: boolean; status: "pending" | "success" | "error"; message: string; }>({ 
     visible: false, 
     status: "pending", 
     message: "" 
   });
-  const [newAlumniData, setNewAlumniData] = useState({ name: "", graduationYear: "", donation: "" });
-  const [selectedAlumni, setSelectedAlumni] = useState<AlumniData | null>(null);
-  const [decryptedDonation, setDecryptedDonation] = useState<number | null>(null);
+  const [newRequestData, setNewRequestData] = useState({ title: "", amount: "", category: "" });
+  const [selectedRequest, setSelectedRequest] = useState<AlumniRequest | null>(null);
+  const [decryptedAmount, setDecryptedAmount] = useState<number | null>(null);
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [contractAddress, setContractAddress] = useState("");
   const [fhevmInitializing, setFhevmInitializing] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
+  const [userHistory, setUserHistory] = useState<AlumniRequest[]>([]);
+  const [stats, setStats] = useState({ total: 0, verified: 0, pending: 0 });
 
   const { status, initialize, isInitialized } = useFhevm();
   const { encrypt, isEncrypting } = useEncrypt();
@@ -45,13 +48,18 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
-      if (!isConnected || isInitialized || fhevmInitializing) return;
+      if (!isConnected) return;
+      if (isInitialized || fhevmInitializing) return;
       
       try {
         setFhevmInitializing(true);
         await initialize();
       } catch (error) {
-        setTransactionStatus({ visible: true, status: "error", message: "FHEVM initialization failed" });
+        setTransactionStatus({ 
+          visible: true, 
+          status: "error", 
+          message: "FHEVM initialization failed" 
+        });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       } finally {
         setFhevmInitializing(false);
@@ -91,20 +99,20 @@ const App: React.FC = () => {
       if (!contract) return;
       
       const businessIds = await contract.getAllBusinessIds();
-      const alumniDataList: AlumniData[] = [];
+      const requestsList: AlumniRequest[] = [];
       
       for (const businessId of businessIds) {
         try {
           const businessData = await contract.getBusinessData(businessId);
-          alumniDataList.push({
+          requestsList.push({
             id: businessId,
             name: businessData.name,
-            graduationYear: businessData.description,
-            encryptedDonation: businessId,
-            timestamp: Number(businessData.timestamp),
-            creator: businessData.creator,
+            encryptedValue: businessId,
             publicValue1: Number(businessData.publicValue1) || 0,
             publicValue2: Number(businessData.publicValue2) || 0,
+            description: businessData.description,
+            timestamp: Number(businessData.timestamp),
+            creator: businessData.creator,
             isVerified: businessData.isVerified,
             decryptedValue: Number(businessData.decryptedValue) || 0
           });
@@ -113,7 +121,9 @@ const App: React.FC = () => {
         }
       }
       
-      setAlumniList(alumniDataList);
+      setRequests(requestsList);
+      updateStats(requestsList);
+      updateUserHistory(requestsList);
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -122,60 +132,72 @@ const App: React.FC = () => {
     }
   };
 
-  const createAlumni = async () => {
+  const updateStats = (requests: AlumniRequest[]) => {
+    const total = requests.length;
+    const verified = requests.filter(r => r.isVerified).length;
+    setStats({ total, verified, pending: total - verified });
+  };
+
+  const updateUserHistory = (requests: AlumniRequest[]) => {
+    if (!address) return;
+    const userRequests = requests.filter(r => r.creator.toLowerCase() === address.toLowerCase());
+    setUserHistory(userRequests);
+  };
+
+  const createRequest = async () => {
     if (!isConnected || !address) { 
       setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return; 
     }
     
-    setCreatingAlumni(true);
-    setTransactionStatus({ visible: true, status: "pending", message: "Creating alumni record with FHE..." });
+    setCreatingRequest(true);
+    setTransactionStatus({ visible: true, status: "pending", message: "Creating request with FHE..." });
     
     try {
       const contract = await getContractWithSigner();
-      if (!contract) throw new Error("Failed to get contract with signer");
+      if (!contract) throw new Error("Failed to get contract");
       
-      const donationValue = parseInt(newAlumniData.donation) || 0;
-      const businessId = `alumni-${Date.now()}`;
+      const amountValue = parseInt(newRequestData.amount) || 0;
+      const businessId = `request-${Date.now()}`;
       
-      const encryptedResult = await encrypt(contractAddress, address, donationValue);
+      const encryptedResult = await encrypt(contractAddress, address, amountValue);
       
       const tx = await contract.createBusinessData(
         businessId,
-        newAlumniData.name,
+        newRequestData.title,
         encryptedResult.encryptedData,
         encryptedResult.proof,
-        parseInt(newAlumniData.graduationYear) || 0,
+        parseInt(newRequestData.category) || 0,
         0,
-        newAlumniData.graduationYear
+        "Alumni Support Request"
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for confirmation..." });
       await tx.wait();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Alumni record created!" });
+      setTransactionStatus({ visible: true, status: "success", message: "Request created!" });
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
       
       await loadData();
       setShowCreateModal(false);
-      setNewAlumniData({ name: "", graduationYear: "", donation: "" });
+      setNewRequestData({ title: "", amount: "", category: "" });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
         ? "Transaction rejected" 
-        : "Submission failed: " + (e.message || "Unknown error");
+        : "Submission failed";
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
-      setCreatingAlumni(false); 
+      setCreatingRequest(false); 
     }
   };
 
   const decryptData = async (businessId: string): Promise<number | null> => {
     if (!isConnected || !address) { 
-      setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
+      setTransactionStatus({ visible: true, status: "error", message: "Connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
     }
@@ -188,7 +210,7 @@ const App: React.FC = () => {
       const businessData = await contractRead.getBusinessData(businessId);
       if (businessData.isVerified) {
         const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "Data already verified" });
+        setTransactionStatus({ visible: true, status: "success", message: "Already verified" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
         return storedValue;
       }
@@ -205,20 +227,20 @@ const App: React.FC = () => {
           contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Verifying..." });
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
       await loadData();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted!" });
+      setTransactionStatus({ visible: true, status: "success", message: "Verified successfully!" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
       
       return Number(clearValue);
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified" });
+        setTransactionStatus({ visible: true, status: "success", message: "Already verified" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
         await loadData();
         return null;
@@ -232,55 +254,66 @@ const App: React.FC = () => {
     }
   };
 
+  const handleDecrypt = async (requestId: string) => {
+    const decrypted = await decryptData(requestId);
+    if (decrypted !== null) {
+      setDecryptedAmount(decrypted);
+    }
+  };
+
+  const filteredRequests = requests.filter(request => 
+    request.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    request.description.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
   const checkAvailability = async () => {
     try {
       const contract = await getContractReadOnly();
       if (!contract) return;
       
-      const isAvailable = await contract.isAvailable();
-      if (isAvailable) {
-        setTransactionStatus({ visible: true, status: "success", message: "Contract is available!" });
+      const isAvail = await contract.isAvailable();
+      if (isAvail) {
+        setTransactionStatus({ visible: true, status: "success", message: "System available!" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
       }
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Failed to check availability" });
+      setTransactionStatus({ visible: true, status: "error", message: "Check failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     }
   };
-
-  const filteredAlumni = alumniList.filter(alumni => 
-    alumni.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
-    alumni.graduationYear.toLowerCase().includes(searchTerm.toLowerCase())
-  );
 
   if (!isConnected) {
     return (
       <div className="app-container">
         <header className="app-header">
           <div className="logo">
-            <h1>Private Alumni Network 🔐</h1>
+            <h1>隱私校友圈</h1>
+            <p>FHE加密校友网络</p>
           </div>
           <div className="header-actions">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            <div className="wallet-connect-wrapper">
+              <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            </div>
           </div>
         </header>
         
         <div className="connection-prompt">
           <div className="connection-content">
-            <h2>Connect Your Wallet</h2>
-            <p>Verify your alumni status and access the encrypted network</p>
+            <div className="connection-icon">🎓</div>
+            <h2>连接钱包加入校友网络</h2>
+            <p>使用加密技术保护校友隐私，实现匿名互助</p>
             <div className="connection-steps">
               <div className="step">
                 <span>1</span>
-                <p>Connect your wallet</p>
+                <p>连接钱包</p>
               </div>
               <div className="step">
                 <span>2</span>
-                <p>Initialize FHE system</p>
+                <p>初始化FHE加密系统</p>
               </div>
               <div className="step">
                 <span>3</span>
-                <p>Access encrypted alumni network</p>
+                <p>开始加密互助</p>
               </div>
             </div>
           </div>
@@ -293,7 +326,8 @@ const App: React.FC = () => {
     return (
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
-        <p>Initializing FHE System...</p>
+        <p>初始化FHE加密系统...</p>
+        <p className="loading-note">正在建立安全连接</p>
       </div>
     );
   }
@@ -301,7 +335,7 @@ const App: React.FC = () => {
   if (loading) return (
     <div className="loading-screen">
       <div className="fhe-spinner"></div>
-      <p>Loading alumni data...</p>
+      <p>加载加密校友网络...</p>
     </div>
   );
 
@@ -309,102 +343,163 @@ const App: React.FC = () => {
     <div className="app-container">
       <header className="app-header">
         <div className="logo">
-          <h1>Private Alumni Network 🔐</h1>
+          <h1>隱私校友圈</h1>
+          <p>FHE加密校友网络</p>
         </div>
         
         <div className="header-actions">
-          <button onClick={() => setShowCreateModal(true)} className="create-btn">
-            + Add Alumni
+          <button 
+            onClick={() => setShowCreateModal(true)} 
+            className="create-btn"
+          >
+            + 创建互助请求
           </button>
-          <button onClick={checkAvailability} className="check-btn">
-            Check Availability
-          </button>
-          <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          <div className="wallet-connect-wrapper">
+            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          </div>
         </div>
       </header>
       
       <div className="main-content-container">
-        <div className="search-section">
-          <input
-            type="text"
-            placeholder="Search alumni..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="search-input"
-          />
-          <button onClick={loadData} className="refresh-btn" disabled={isRefreshing}>
-            {isRefreshing ? "Refreshing..." : "Refresh"}
-          </button>
+        <div className="dashboard-section">
+          <div className="stats-panel">
+            <div className="stat-card">
+              <h3>总请求</h3>
+              <div className="stat-value">{stats.total}</div>
+            </div>
+            <div className="stat-card">
+              <h3>已验证</h3>
+              <div className="stat-value">{stats.verified}</div>
+            </div>
+            <div className="stat-card">
+              <h3>待验证</h3>
+              <div className="stat-value">{stats.pending}</div>
+            </div>
+          </div>
+          
+          <div className="fhe-flow">
+            <div className="flow-step">
+              <div className="step-icon">1</div>
+              <div className="step-content">
+                <h4>数据加密</h4>
+                <p>敏感数据使用FHE加密保护</p>
+              </div>
+            </div>
+            <div className="flow-arrow">→</div>
+            <div className="flow-step">
+              <div className="step-icon">2</div>
+              <div className="step-content">
+                <h4>链上存储</h4>
+                <p>加密数据存储在区块链上</p>
+              </div>
+            </div>
+            <div className="flow-arrow">→</div>
+            <div className="flow-step">
+              <div className="step-icon">3</div>
+              <div className="step-content">
+                <h4>离线解密</h4>
+                <p>客户端离线解密验证数据</p>
+              </div>
+            </div>
+          </div>
         </div>
         
-        <div className="alumni-stats">
-          <div className="stat-card">
-            <h3>Total Alumni</h3>
-            <p>{alumniList.length}</p>
-          </div>
-          <div className="stat-card">
-            <h3>Verified Data</h3>
-            <p>{alumniList.filter(a => a.isVerified).length}</p>
-          </div>
-          <div className="stat-card">
-            <h3>Avg Graduation Year</h3>
-            <p>{alumniList.length > 0 ? 
-              Math.round(alumniList.reduce((sum, a) => sum + a.publicValue1, 0) / alumniList.length) : 
-              'N/A'}
-            </p>
-          </div>
-        </div>
-        
-        <div className="alumni-list">
-          {filteredAlumni.length === 0 ? (
-            <div className="no-alumni">
-              <p>No alumni records found</p>
-              <button className="create-btn" onClick={() => setShowCreateModal(true)}>
-                Add First Alumni
+        <div className="requests-section">
+          <div className="section-header">
+            <h2>校友互助请求</h2>
+            <div className="search-bar">
+              <input 
+                type="text" 
+                placeholder="搜索请求..." 
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+              />
+              <button 
+                onClick={loadData} 
+                className="refresh-btn" 
+                disabled={isRefreshing}
+              >
+                {isRefreshing ? "刷新中..." : "刷新"}
               </button>
             </div>
-          ) : filteredAlumni.map((alumni, index) => (
-            <div 
-              className={`alumni-item ${selectedAlumni?.id === alumni.id ? "selected" : ""} ${alumni.isVerified ? "verified" : ""}`} 
-              key={index}
-              onClick={() => setSelectedAlumni(alumni)}
-            >
-              <div className="alumni-name">{alumni.name}</div>
-              <div className="alumni-meta">
-                <span>Graduated: {alumni.graduationYear}</span>
-                <span>Joined: {new Date(alumni.timestamp * 1000).toLocaleDateString()}</span>
+          </div>
+          
+          <div className="requests-list">
+            {filteredRequests.length === 0 ? (
+              <div className="no-requests">
+                <p>未找到互助请求</p>
+                <button 
+                  className="create-btn" 
+                  onClick={() => setShowCreateModal(true)}
+                >
+                  创建第一个请求
+                </button>
               </div>
-              <div className="alumni-status">
-                {alumni.isVerified ? 
-                  `✅ Verified Donation: ${alumni.decryptedValue}` : 
-                  "🔓 Encrypted Donation"}
+            ) : filteredRequests.map((request, index) => (
+              <div 
+                className={`request-card ${selectedRequest?.id === request.id ? "selected" : ""} ${request.isVerified ? "verified" : ""}`} 
+                key={index}
+                onClick={() => setSelectedRequest(request)}
+              >
+                <div className="request-title">{request.name}</div>
+                <div className="request-meta">
+                  <span>类型: {request.publicValue1 === 1 ? "捐赠" : "求助"}</span>
+                  <span>日期: {new Date(request.timestamp * 1000).toLocaleDateString()}</span>
+                </div>
+                <div className="request-description">{request.description}</div>
+                <div className="request-status">
+                  {request.isVerified ? (
+                    <span className="verified">✅ 已验证金额: {request.decryptedValue}</span>
+                  ) : (
+                    <span className="pending">🔒 加密金额待验证</span>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
+        </div>
+        
+        <div className="history-section">
+          <h2>我的操作记录</h2>
+          <div className="history-list">
+            {userHistory.length === 0 ? (
+              <div className="no-history">
+                <p>暂无操作记录</p>
+              </div>
+            ) : userHistory.map((item, index) => (
+              <div className="history-item" key={index}>
+                <div className="history-title">{item.name}</div>
+                <div className="history-meta">
+                  <span>{new Date(item.timestamp * 1000).toLocaleDateString()}</span>
+                  <span>{item.isVerified ? "已验证" : "待验证"}</span>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
       
       {showCreateModal && (
-        <ModalCreateAlumni 
-          onSubmit={createAlumni} 
+        <ModalCreateRequest 
+          onSubmit={createRequest} 
           onClose={() => setShowCreateModal(false)} 
-          creating={creatingAlumni} 
-          alumniData={newAlumniData} 
-          setAlumniData={setNewAlumniData}
+          creating={creatingRequest} 
+          requestData={newRequestData} 
+          setRequestData={setNewRequestData}
           isEncrypting={isEncrypting}
         />
       )}
       
-      {selectedAlumni && (
-        <AlumniDetailModal 
-          alumni={selectedAlumni} 
+      {selectedRequest && (
+        <RequestDetailModal 
+          request={selectedRequest} 
           onClose={() => { 
-            setSelectedAlumni(null); 
-            setDecryptedDonation(null); 
+            setSelectedRequest(null); 
+            setDecryptedAmount(null); 
           }} 
-          decryptedDonation={decryptedDonation} 
+          decryptedAmount={decryptedAmount}
           isDecrypting={isDecrypting || fheIsDecrypting} 
-          decryptData={() => decryptData(selectedAlumni.id)}
+          decryptData={() => handleDecrypt(selectedRequest.id)}
         />
       )}
       
@@ -420,78 +515,95 @@ const App: React.FC = () => {
           </div>
         </div>
       )}
+      
+      <div className="system-check">
+        <button onClick={checkAvailability} className="system-btn">
+          检查系统状态
+        </button>
+      </div>
     </div>
   );
 };
 
-const ModalCreateAlumni: React.FC<{
+const ModalCreateRequest: React.FC<{
   onSubmit: () => void; 
   onClose: () => void; 
   creating: boolean;
-  alumniData: any;
-  setAlumniData: (data: any) => void;
+  requestData: any;
+  setRequestData: (data: any) => void;
   isEncrypting: boolean;
-}> = ({ onSubmit, onClose, creating, alumniData, setAlumniData, isEncrypting }) => {
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+}> = ({ onSubmit, onClose, creating, requestData, setRequestData, isEncrypting }) => {
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
-    setAlumniData({ ...alumniData, [name]: value });
+    if (name === 'amount') {
+      const intValue = value.replace(/[^\d]/g, '');
+      setRequestData({ ...requestData, [name]: intValue });
+    } else {
+      setRequestData({ ...requestData, [name]: value });
+    }
   };
 
   return (
     <div className="modal-overlay">
-      <div className="create-alumni-modal">
+      <div className="create-request-modal">
         <div className="modal-header">
-          <h2>Add Alumni Record</h2>
+          <h2>创建互助请求</h2>
           <button onClick={onClose} className="close-modal">&times;</button>
         </div>
         
         <div className="modal-body">
+          <div className="fhe-notice">
+            <strong>FHE加密保护</strong>
+            <p>金额将使用全同态加密技术保护</p>
+          </div>
+          
           <div className="form-group">
-            <label>Name *</label>
+            <label>请求标题 *</label>
             <input 
               type="text" 
-              name="name" 
-              value={alumniData.name} 
+              name="title" 
+              value={requestData.title} 
               onChange={handleChange} 
-              placeholder="Enter name..." 
+              placeholder="输入请求标题..." 
             />
           </div>
           
           <div className="form-group">
-            <label>Graduation Year *</label>
+            <label>金额 (整数) *</label>
             <input 
               type="number" 
-              name="graduationYear" 
-              value={alumniData.graduationYear} 
+              name="amount" 
+              value={requestData.amount} 
               onChange={handleChange} 
-              placeholder="Enter graduation year..." 
-              min="1900"
-              max="2099"
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Donation Amount (FHE Encrypted) *</label>
-            <input 
-              type="number" 
-              name="donation" 
-              value={alumniData.donation} 
-              onChange={handleChange} 
-              placeholder="Enter donation amount..." 
+              placeholder="输入金额..." 
+              step="1"
               min="0"
             />
-            <div className="data-type-label">FHE Encrypted Integer</div>
+            <div className="data-type-label">FHE加密整数</div>
+          </div>
+          
+          <div className="form-group">
+            <label>请求类型 *</label>
+            <select 
+              name="category" 
+              value={requestData.category} 
+              onChange={handleChange}
+            >
+              <option value="">选择类型</option>
+              <option value="1">捐赠</option>
+              <option value="2">求助</option>
+            </select>
           </div>
         </div>
         
         <div className="modal-footer">
-          <button onClick={onClose} className="cancel-btn">Cancel</button>
+          <button onClick={onClose} className="cancel-btn">取消</button>
           <button 
             onClick={onSubmit} 
-            disabled={creating || isEncrypting || !alumniData.name || !alumniData.graduationYear || !alumniData.donation} 
+            disabled={creating || isEncrypting || !requestData.title || !requestData.amount || !requestData.category} 
             className="submit-btn"
           >
-            {creating || isEncrypting ? "Encrypting..." : "Create Record"}
+            {creating || isEncrypting ? "加密中..." : "创建请求"}
           </button>
         </div>
       </div>
@@ -499,81 +611,96 @@ const ModalCreateAlumni: React.FC<{
   );
 };
 
-const AlumniDetailModal: React.FC<{
-  alumni: AlumniData;
+const RequestDetailModal: React.FC<{
+  request: AlumniRequest;
   onClose: () => void;
-  decryptedDonation: number | null;
+  decryptedAmount: number | null;
   isDecrypting: boolean;
-  decryptData: () => Promise<number | null>;
-}> = ({ alumni, onClose, decryptedDonation, isDecrypting, decryptData }) => {
-  const handleDecrypt = async () => {
-    if (decryptedDonation !== null) return;
-    const decrypted = await decryptData();
-    if (decrypted !== null) {
-      setDecryptedDonation(decrypted);
-    }
-  };
-
+  decryptData: () => void;
+}> = ({ request, onClose, decryptedAmount, isDecrypting, decryptData }) => {
   return (
     <div className="modal-overlay">
-      <div className="alumni-detail-modal">
+      <div className="request-detail-modal">
         <div className="modal-header">
-          <h2>Alumni Details</h2>
+          <h2>请求详情</h2>
           <button onClick={onClose} className="close-modal">&times;</button>
         </div>
         
         <div className="modal-body">
-          <div className="alumni-info">
+          <div className="request-info">
             <div className="info-item">
-              <span>Name:</span>
-              <strong>{alumni.name}</strong>
+              <span>标题:</span>
+              <strong>{request.name}</strong>
             </div>
             <div className="info-item">
-              <span>Graduation Year:</span>
-              <strong>{alumni.graduationYear}</strong>
+              <span>创建者:</span>
+              <strong>{request.creator.substring(0, 6)}...{request.creator.substring(38)}</strong>
             </div>
             <div className="info-item">
-              <span>Record Created:</span>
-              <strong>{new Date(alumni.timestamp * 1000).toLocaleDateString()}</strong>
+              <span>日期:</span>
+              <strong>{new Date(request.timestamp * 1000).toLocaleDateString()}</strong>
+            </div>
+            <div className="info-item">
+              <span>类型:</span>
+              <strong>{request.publicValue1 === 1 ? "捐赠" : "求助"}</strong>
             </div>
           </div>
           
+          <div className="description-section">
+            <h3>详细描述</h3>
+            <p>{request.description}</p>
+          </div>
+          
           <div className="data-section">
-            <h3>Encrypted Donation</h3>
-            
+            <h3>加密金额</h3>
             <div className="data-row">
-              <div className="data-label">Donation Amount:</div>
+              <div className="data-label">金额:</div>
               <div className="data-value">
-                {alumni.isVerified ? 
-                  `${alumni.decryptedValue} (Verified)` : 
-                  decryptedDonation !== null ? 
-                  `${decryptedDonation} (Decrypted)` : 
-                  "🔒 FHE Encrypted"
+                {request.isVerified ? 
+                  `${request.decryptedValue} (已验证)` : 
+                  decryptedAmount !== null ? 
+                  `${decryptedAmount} (已解密)` : 
+                  "🔒 FHE加密整数"
                 }
               </div>
-              {!alumni.isVerified && (
-                <button 
-                  className={`decrypt-btn ${decryptedDonation !== null ? 'decrypted' : ''}`}
-                  onClick={handleDecrypt} 
-                  disabled={isDecrypting}
-                >
-                  {isDecrypting ? "Decrypting..." : "Decrypt"}
-                </button>
-              )}
+              <button 
+                className={`decrypt-btn ${(request.isVerified || decryptedAmount !== null) ? 'decrypted' : ''}`}
+                onClick={decryptData} 
+                disabled={isDecrypting}
+              >
+                {isDecrypting ? (
+                  "🔓 验证中..."
+                ) : request.isVerified ? (
+                  "✅ 已验证"
+                ) : decryptedAmount !== null ? (
+                  "🔄 重新验证"
+                ) : (
+                  "🔓 验证金额"
+                )}
+              </button>
             </div>
             
             <div className="fhe-info">
               <div className="fhe-icon">🔐</div>
               <div>
-                <strong>FHE Encrypted Data</strong>
-                <p>Donation amount is encrypted on-chain using FHE technology.</p>
+                <strong>FHE全同态加密</strong>
+                <p>金额在链上加密存储，点击验证进行解密和链上验证</p>
               </div>
             </div>
           </div>
         </div>
         
         <div className="modal-footer">
-          <button onClick={onClose} className="close-btn">Close</button>
+          <button onClick={onClose} className="close-btn">关闭</button>
+          {!request.isVerified && (
+            <button 
+              onClick={decryptData} 
+              disabled={isDecrypting}
+              className="verify-btn"
+            >
+              {isDecrypting ? "链上验证中..." : "链上验证"}
+            </button>
+          )}
         </div>
       </div>
     </div>
